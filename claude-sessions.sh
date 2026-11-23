@@ -132,6 +132,23 @@ first_matches() {
   fi
 }
 
+# Session files are JSON, so a query has to be searched for as it's stored there
+# (a typed \ is written as \\, a " as \").
+json_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+
+# Line number of the first line in file $1 matching the content filter, or nothing
+# when there's no content filter or no match.
+match_line() {
+  [ "$SEARCH_MODE" = content ] && [ -n "$FILTER" ] || return 0
+  local esc
+  esc="$(json_escape "$FILTER")"
+  if command -v rg >/dev/null; then
+    rg -iF -m1 --line-number --no-heading --no-messages -e "$esc" -- "$1" | cut -d: -f1
+  else
+    grep -iF -m1 -n -e "$esc" -- "$1" 2>/dev/null | cut -d: -f1
+  fi
+}
+
 # Keeps only sessions matching FILTER (case-insensitive): by title, or anywhere
 # in the session file when SEARCH_MODE is "content". Content matches also fill
 # SNIPPETS with the text around the first hit, the match highlighted.
@@ -140,9 +157,7 @@ apply_filter() {
   local i a f snip esc hits=""
   local -a keep=() tmp
   if [ "$SEARCH_MODE" = content ]; then
-    # Session files are JSON, so search for the query as it's stored there
-    # (a typed \ is written as \\, a " as \").
-    esc="$(printf '%s' "$FILTER" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+    esc="$(json_escape "$FILTER")"
     # First matching line per file, then cut the snippet in awk (a context regex
     # like '.{0,30}q.{0,30}' is very slow in BSD grep).
     hits="$(first_matches "$esc" "${FILES[@]}" | Q="$FILTER" E="$esc" awk '
@@ -257,17 +272,114 @@ parse_selection() {
   done
 }
 
-# Runs claude in a subshell so the script's list comes back when it exits.
-# Returns 1 if claude couldn't be started.
-open_session() {
-  local i=$1
+# Runs claude with the given arguments from folder $1, in a subshell so the
+# script's list comes back when it exits. Returns 1 if claude isn't installed.
+run_claude() {
+  local dir=$1; shift
   command -v claude >/dev/null || { echo '`claude` not found on PATH'; return 1; }
   (
-    # Sessions are scoped per project, so resume from the directory they were started in.
-    [ -n "${CWDS[i]}" ] && [ -d "${CWDS[i]}" ] && cd "${CWDS[i]}"
-    echo "Resuming ${UIDS[i]} in $PWD ..."
-    claude --resume "${UIDS[i]}"
+    # Sessions are scoped per project, so run from the directory they were started in.
+    [ -n "$dir" ] && [ -d "$dir" ] && cd "$dir"
+    echo "Running claude $* in $PWD ..."
+    claude "$@"
   )
+}
+
+open_session() {
+  run_claude "${CWDS[$1]}" --resume "${UIDS[$1]}"
+}
+
+# Folder the project's sessions were started in (any session's cwd), else $PWD.
+project_cwd() {
+  local d
+  for d in ${A_CWDS[@]+"${A_CWDS[@]}"}; do
+    [ -n "$d" ] && [ -d "$d" ] && { echo "$d"; return; }
+  done
+  echo "$PWD"
+}
+
+# Starts a new session in the project's folder, named $1 (asked for when empty).
+new_session() {
+  local name=$1
+  [ -n "$name" ] || read -e -r -p "Name for the new session (Enter for none): " name
+  if [ -n "$name" ]; then
+    run_claude "$(project_cwd)" --name "$name"
+  else
+    run_claude "$(project_cwd)"
+  fi
+}
+
+# jq helpers shared by preview and fork: a message's text, and whether it's a
+# prompt you typed (not a tool result or system-injected text).
+JQ_DEFS='
+  def txt: (.message.content? // "")
+    | if type == "string" then .
+      elif type == "array" then (map(select(.type? == "text") | .text // "") | join("\n"))
+      else "" end;
+  def prompt: .type == "user" and (txt | . != "" and (startswith("<") | not));
+  def entries: [inputs] | to_entries
+    | [.[] | (.value | fromjson? // null) as $e | select($e | type == "object") | {line: (.key + 1), e: $e}];
+'
+
+# Shows the messages around the content match in session $1 (the last few
+# messages when there's no content filter), in a pager.
+preview_session() {
+  local i=$1 m
+  m="$(match_line "${FILES[i]}")"
+  {
+    printf '%s  %s\n' "${UIDS[i]}" "${TITLES[i]}"
+    [ -n "$m" ] && printf 'First match for "%s" is around the >> message. f %s forks from that point.\n' "$FILTER" $((i + 1))
+    echo
+    jq -Rrn --argjson m "${m:-1e18}" --arg q "${m:+$FILTER}" "$JQ_DEFS"'
+      def rx: gsub("(?<c>[.*+?^${}()|\\[\\]\\\\/])"; "\\\(.c)");
+      def mark: if $q == "" then . else gsub("(?<x>" + ($q | rx) + ")"; "\u001b[1;33m\(.x)\u001b[0m"; "i") end;
+      # Long messages: keep the part around the match.
+      def around($n):
+        if length <= $n then .
+        else ((if $q == "" then null else (match($q | rx; "i").offset? // null) end) // 0) as $o
+          | ([$o - ($n / 2 | floor), 0] | max) as $s
+          | (if $s > 0 then "… " else "" end) + .[$s:$s + $n] + (if $s + $n < length then " …" else "" end)
+        end;
+      entries as $all
+      | [$all[] | select(.e | prompt or (.type == "assistant" and (txt != "")))] as $d
+      | if ($d | length) == 0 then "(no messages to show)" else
+          (([$d | to_entries[] | select(.value.line <= $m)] | last | .key) // 0) as $c
+          # With a match: 2 messages either side of it. Without: the last 5.
+          | (if $q == "" then 4 else 2 end) as $before
+          | [range([$c - $before, 0] | max; [$c + 3, ($d | length)] | min)]
+          | map(. as $k | $d[$k]
+              | (if $k == $c and $q != "" then ">> " else "   " end)
+                + (if .e.type == "user" then "You" else "Claude" end) + ":\n      "
+                + (.e | txt | around(if $k == $c then 1500 else 300 end) | mark | gsub("\n"; "\n      "))
+                + (if $k == $c and $q != "" and .line != $m then "\n      (the match itself is in a tool call or result that follows)" else "" end))
+          | join("\n\n")
+        end
+    ' "${FILES[i]}"
+  } | if command -v less >/dev/null; then less -R; else cat; read -rsn1 -p "Press any key to continue..." _; fi
+}
+
+# Forks session $1 at the turn holding the first content match: the new session
+# keeps the messages up to the end of that turn, the original stays unchanged.
+# Uses claude's hidden --resume-session-at option.
+fork_at_match() {
+  local i=$1 m point uuid prompt title
+  m="$(match_line "${FILES[i]}")"
+  [ -n "$m" ] || { echo "Search contents first (Tab, then type) so there's a match to fork from."; return 1; }
+  # Fork point: the last entry before the next prompt you typed after the match.
+  point="$(jq -Rrn --argjson m "$m" "$JQ_DEFS"'
+    entries as $all
+    | (([$all[] | select(.line > $m and (.e | prompt)) | .line] | first) // infinite) as $next
+    | ([$all[] | select(.line < $next and (.e.uuid | type) == "string")] | last | .e.uuid) as $uuid
+    | ([$all[] | select(.line <= $m and (.e | prompt))] | last | .e | txt) as $p
+    | select($uuid != null)
+    | "\($uuid)\t\(($p // "") | gsub("\\s+"; " ") | .[:80])"
+  ' "${FILES[i]}")"
+  [ -n "$point" ] || { echo "Couldn't find a message to fork from."; return 1; }
+  IFS=$'\t' read -r uuid prompt <<< "$point"
+  title="${TITLES[i]}"
+  [ "$title" = "(no title)" ] && title="${UIDS[i]}"
+  echo "Forking ${UIDS[i]} after the turn that starts: ${prompt:-(unknown)}"
+  run_claude "${CWDS[i]}" --resume "${UIDS[i]}" --resume-session-at "$uuid" --fork-session --name "${title}_forked"
 }
 
 delete_sessions() {
@@ -304,11 +416,27 @@ clone_sessions() {
 # Reads and runs one command against the current (filtered) list. Returns 1 to quit.
 run_command() {
   local cmd
-  read -e -r -p "<n|id> open · c <n,n-m|id...> clone · d <n,n-m|id...> delete · q quit > " cmd || return 1
+  echo "<n|id> open · p <n> preview · n [name] new · c <n,n-m|id...> clone · f <n> fork at match · d <n,n-m|id...> delete · q quit"
+  read -e -r -p "> " cmd || return 1
   cmd="$(echo "$cmd" | xargs)"
   [ -z "$cmd" ] && return 0
   case "$(echo "$cmd" | tr '[:upper:]' '[:lower:]')" in
     q | quit | exit) return 1 ;;
+    n | "n "*)
+      new_session "${cmd:2}" && return 0 ;;
+    "p "*)
+      if parse_selection "${cmd:2}"; then
+        [ ${#SELECTED[@]} -eq 1 ] && { preview_session "${SELECTED[0]}"; return 0; }
+        echo "Pick exactly one session to preview."
+      fi ;;
+    "f "*)
+      if parse_selection "${cmd:2}"; then
+        if [ ${#SELECTED[@]} -ne 1 ]; then
+          echo "Pick exactly one session to fork."
+        else
+          fork_at_match "${SELECTED[0]}" && return 0
+        fi
+      fi ;;
     "d "*)
       parse_selection "${cmd:2}" && delete_sessions ;;
     "c "*)
